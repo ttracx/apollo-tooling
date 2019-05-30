@@ -9,7 +9,8 @@ import {
   CheckSchema_service_checkSchema,
   CheckSchema_service_checkSchema_diffToPrevious_changes as Change,
   ChangeSeverity,
-  CheckSchemaVariables
+  CheckSchemaVariables,
+  IntrospectionSchemaInput
 } from "apollo-language-server/lib/graphqlTypes";
 import {
   ApolloConfig,
@@ -18,6 +19,10 @@ import {
 } from "apollo-language-server";
 import moment from "moment";
 import sortBy from "lodash.sortby";
+import cli from "cli-ux";
+
+export const federatedServiceCompositionUnsuccessfulErrorMessage =
+  "Federated service composition was unsuccessful. Please see the reasons below.";
 
 export const federatedServiceCompositionUnsuccessfulErrorMessage =
   "Federated service composition was unsuccessful. Please see the reasons below.";
@@ -271,6 +276,7 @@ export default class ServiceCheck extends ProjectCommand {
 
           const configName = config.name;
           const tag = flags.tag || config.tag || "current";
+          const serviceName = flags.serviceName;
 
           if (!configName) {
             throw new Error("No service found to link to Engine");
@@ -285,7 +291,13 @@ export default class ServiceCheck extends ProjectCommand {
                 task.output = "Resolving schema";
                 taskOutput.shouldOutputJson = flags.json;
 
-                if (flags.federated) {
+                // If we're `federated`, then run composition validation. When we're using composition
+                // validation we'll receive a schema has that represents the composed schema.
+                if (serviceName) {
+                  this.debug("running composition validation");
+                  task.output = `Creating composed schema with ${chalk.blue(
+                    serviceName
+                  )} service`;
                   const info = await project.resolveFederationInfo();
                   if (!info.sdl)
                     throw new Error("No SDL found for federated service");
@@ -296,7 +308,6 @@ export default class ServiceCheck extends ProjectCommand {
                    * name: implementing service name inside of the graph
                    * sha: git commit hash/docker id. placeholder for now
                    */
-                  task.output = "Creating composed schema against the graph";
                   const {
                     errors,
                     warnings,
@@ -304,14 +315,13 @@ export default class ServiceCheck extends ProjectCommand {
                   } = await project.engine.checkPartialSchema({
                     id: configName,
                     graphVariant: tag,
-                    implementingServiceName: flags.serviceName || info.name,
+                    implementingServiceName: serviceName,
                     partialSchema: {
                       sdl: info.sdl
                     }
                   });
 
                   // FIXME: reformat to match other check results
-
                   taskOutput.federation = {
                     errors,
                     warnings
@@ -319,56 +329,108 @@ export default class ServiceCheck extends ProjectCommand {
 
                   if (compositionValidationDetails) {
                     schemaHash = compositionValidationDetails.schemaHash;
-                  } else {
-                    // FIXME: We should provide some better error handling at the GraphQL layer for this
-                    throw new Error(`Federated service could not be composed due to the following errors:
-  ${errors && errors.map(err => (err && err.message) || "").join("\n")}
-                  `);
+                  }
+
+                  if (errors.length > 0) {
+                    const decodedErrors = errors.filter(Boolean).map(error => {
+                      // We `filter` by `Boolean` above; this will never happen and is just here to appease
+                      // TypeScript.
+                      if (!error) {
+                        return {};
+                      }
+
+                      const match = error.message.match(
+                        /^\[([^\[]+)\]\s+(\S+)\ ->\ (.+)/
+                      );
+
+                      if (!match) {
+                        // If we can't match the errors, that means they're in a format we don't recognize.
+                        // Report the entire string as the user will see the raw message.
+                        return { message: error.message };
+                      }
+
+                      const [, service, field, message] = match;
+                      return { service, field, message };
+                    });
+
+                    let result = "";
+
+                    cli.table(decodedErrors, {
+                      columns: [
+                        { key: "service", label: "Service" },
+                        { key: "field", label: "Field" },
+                        { key: "message", label: "Message" }
+                      ],
+                      // The default `printLine` will output to the console; we want to capture the output so we can test
+                      // it.
+                      printLine: line => {
+                        result += `\n${line}`;
+                      }
+                    });
+
+                    this.log(result);
+
+                    // We have to throw an error here even though we already reported the errors in a table
+                    // because we need to short-circuit the rest of the tasks in the service check.
+                    throw new Error(
+                      federatedServiceCompositionUnsuccessfulErrorMessage
+                    );
                   }
                 } else {
+                  // This is _not_ a `federated` schema. Resolve the schema given `config.tag`.
+
                   schema = await project.resolveSchema({ tag: config.tag });
+                }
 
-                  await gitInfo(this.log);
+                await gitInfo(this.log);
 
-                  const historicParameters = validateHistoricParams({
-                    validationPeriod: flags.validationPeriod,
-                    queryCountThreshold: flags.queryCountThreshold,
-                    queryCountThresholdPercentage:
-                      flags.queryCountThresholdPercentage
-                  });
+                const historicParameters = validateHistoricParams({
+                  validationPeriod: flags.validationPeriod,
+                  queryCountThreshold: flags.queryCountThreshold,
+                  queryCountThresholdPercentage:
+                    flags.queryCountThresholdPercentage
+                });
 
-                  task.output = "Validating schema";
-                  const variables: CheckSchemaVariables = {
-                    id: configName,
-                    // @ts-ignore
-                    // XXX Looks like TS should be generating ReadonlyArrays instead
-                    schema: introspectionFromSchema(schema).__schema,
-                    tag: flags.tag,
-                    gitContext: await gitInfo(this.log),
-                    frontend: flags.frontend || config.engine.frontend,
-                    ...(historicParameters && { historicParameters })
-                  };
-                  const { schema: _, ...restVariables } = variables;
-                  this.debug("Variables sent to Engine:");
-                  this.debug(restVariables);
+                task.output = "Validating schema";
+
+                const variables: CheckSchemaVariables = {
+                  id: configName,
+                  tag: flags.tag,
+                  gitContext: await gitInfo(this.log),
+                  frontend: flags.frontend || config.engine.frontend,
+                  ...(historicParameters && { historicParameters }),
+                  // `variables` will either contain `schemaHash` or `schema`, not both.
+                  ...(schemaHash
+                    ? { schemaHash }
+                    : {
+                        // XXX Looks like TS should be generating ReadonlyArrays instead
+                        schema: introspectionFromSchema(schema)
+                          .__schema as IntrospectionSchemaInput
+                      })
+                };
+
+                const { schema: _, ...restVariables } = variables;
+                this.debug("Variables sent to Engine:");
+                this.debug(restVariables);
+                if (schema) {
                   this.debug("SDL of introspection sent to Engine:");
                   this.debug(printSchema(schema));
-
-                  const newContext: typeof ctx = {
-                    checkSchemaResult: await project.engine.checkSchema(
-                      variables
-                    ),
-                    config,
-                    shouldOutputJson: !!flags.json,
-                    shouldOutputMarkdown: !!flags.markdown
-                  };
-
-                  Object.assign(ctx, newContext);
-
-                  // Save the output because we're going to use it even if we throw. `runTasks` won't return
-                  // anything if we throw.
-                  Object.assign(taskOutput, ctx);
                 }
+
+                const newContext: typeof ctx = {
+                  checkSchemaResult: await project.engine.checkSchema(
+                    variables
+                  ),
+                  config,
+                  shouldOutputJson: !!flags.json,
+                  shouldOutputMarkdown: !!flags.markdown
+                };
+
+                Object.assign(ctx, newContext);
+
+                // Save the output because we're going to use it even if we throw. `runTasks` won't return
+                // anything if we throw.
+                Object.assign(taskOutput, ctx);
 
                 task.title = task.title.replace("Validating", "Validated");
               }
