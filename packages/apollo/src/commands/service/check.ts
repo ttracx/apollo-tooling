@@ -117,7 +117,7 @@ export function formatMarkdown({
 
   return `
 ### Apollo Service Check
-🔄 Validated your local schema against schema tag \`${tag}\` on service \`${serviceName}\`.
+🔄 Validated your local schema against schema tag \`${tag}\` on graph \`${serviceName}\`.
 🔢 Compared **${pluralize(
     diffToPrevious.changes.length,
     "schema change"
@@ -280,7 +280,7 @@ export default class ServiceCheck extends ProjectCommand {
             {
               title: `Validating local schema against tag ${chalk.blue(
                 tag
-              )} on service ${chalk.blue(configName)}`,
+              )} on graph ${chalk.blue(configName)}`,
               task: async (ctx: TasksOutput, task) => {
                 task.output = "Resolving schema";
                 taskOutput.shouldOutputJson = flags.json;
