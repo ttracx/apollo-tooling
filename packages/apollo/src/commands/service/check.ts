@@ -1,6 +1,6 @@
 import { flags } from "@oclif/command";
 import { table } from "heroku-cli-util";
-import { introspectionFromSchema, printSchema } from "graphql";
+import { introspectionFromSchema, printSchema, GraphQLSchema } from "graphql";
 import chalk from "chalk";
 import { gitInfo } from "../../git";
 import { ProjectCommand } from "../../Command";
@@ -10,7 +10,8 @@ import {
   CheckSchema_service_checkSchema_diffToPrevious_changes as Change,
   ChangeSeverity,
   CheckSchemaVariables,
-  IntrospectionSchemaInput
+  IntrospectionSchemaInput,
+  IntrospectionTypeInput
 } from "apollo-language-server/lib/graphqlTypes";
 import {
   ApolloConfig,
@@ -20,6 +21,7 @@ import {
 import moment from "moment";
 import sortBy from "lodash.sortby";
 import cli from "cli-ux";
+import { continueStatement } from "babel-types";
 
 export const federatedServiceCompositionUnsuccessfulErrorMessage =
   "Federated service composition was unsuccessful. Please see the reasons below.";
@@ -75,11 +77,7 @@ interface TasksOutput {
   checkSchemaResult: CheckSchema_service_checkSchema;
   shouldOutputJson: boolean;
   shouldOutputMarkdown: boolean;
-  federation?: {
-    errors: ({ message: string } | null)[];
-    warnings: ({ message: string } | null)[];
-    schemaHash?: string | null;
-  };
+  federationSchemaHash?: string;
 }
 
 export function formatMarkdown({
@@ -266,7 +264,7 @@ export default class ServiceCheck extends ProjectCommand {
     // Define this constant so we can throw it and compare against the same value.
     const breakingChangesErrorMessage = "breaking changes found";
 
-    let schema, schemaHash;
+    let schema: GraphQLSchema | undefined;
     try {
       await this.runTasks<TasksOutput>(
         ({ config, flags, project }) => {
@@ -276,7 +274,7 @@ export default class ServiceCheck extends ProjectCommand {
 
           const configName = config.name;
           const tag = flags.tag || config.tag || "current";
-          const serviceName = flags.serviceName;
+          const serviceName: string | undefined = flags.serviceName;
 
           if (!configName) {
             throw new Error("No service found to link to Engine");
@@ -284,102 +282,134 @@ export default class ServiceCheck extends ProjectCommand {
 
           return [
             {
-              title: `Validating local schema against tag ${chalk.blue(
-                tag
+              enabled: () => !!serviceName,
+              title: `Validate graph composition for service ${chalk.blue(
+                serviceName || ""
               )} on graph ${chalk.blue(configName)}`,
               task: async (ctx: TasksOutput, task) => {
-                task.output = "Resolving schema";
-                taskOutput.shouldOutputJson = flags.json;
+                if (!serviceName) {
+                  throw new Error(
+                    "This task should not be run without a `serviceName`. Check the `enabled` function."
+                  );
+                }
+                task.output = "Fetching local service's partial schema";
 
-                // If we're `federated`, then run composition validation. When we're using composition
-                // validation we'll receive a schema has that represents the composed schema.
-                if (serviceName) {
-                  this.debug("running composition validation");
-                  task.output = `Creating composed schema with ${chalk.blue(
-                    serviceName
-                  )} service`;
-                  const info = await project.resolveFederationInfo();
-                  if (!info.sdl)
-                    throw new Error("No SDL found for federated service");
+                const info = await project.resolveFederationInfo();
+                if (!info.sdl) {
+                  throw new Error("No SDL found for federated service");
+                }
 
-                  /**
-                   * id: service id for root mutation (graph id)
-                   * variant: like a tag. prod/staging/etc
-                   * name: implementing service name inside of the graph
-                   * sha: git commit hash/docker id. placeholder for now
-                   */
-                  const {
-                    errors,
-                    warnings,
-                    compositionValidationDetails
-                  } = await project.engine.checkPartialSchema({
-                    id: configName,
-                    graphVariant: tag,
-                    implementingServiceName: serviceName,
-                    partialSchema: {
-                      sdl: info.sdl
+                task.output = `Attempting to compose graph with ${chalk.blue(
+                  serviceName
+                )} service's partial schema`;
+
+                const {
+                  errors,
+                  warnings,
+                  compositionValidationDetails
+                } = await project.engine.checkPartialSchema({
+                  id: configName,
+                  graphVariant: tag,
+                  implementingServiceName: serviceName,
+                  partialSchema: {
+                    sdl: info.sdl
+                  }
+                });
+
+                if (
+                  compositionValidationDetails &&
+                  compositionValidationDetails.schemaHash
+                ) {
+                  ctx.federationSchemaHash =
+                    compositionValidationDetails.schemaHash;
+                }
+
+                task.title = `Found ${pluralize(
+                  errors.length,
+                  "graph composition error"
+                )} for service ${chalk.blue(serviceName)} on graph ${chalk.blue(
+                  configName
+                )}`;
+
+                if (errors.length > 0) {
+                  const decodedErrors = errors.filter(Boolean).map(error => {
+                    // We `filter` by `Boolean` above; this will never happen and is just here to appease
+                    // TypeScript.
+                    if (!error) {
+                      return {};
+                    }
+
+                    const match = error.message.match(
+                      /^\[([^\[]+)\]\s+(\S+)\ ->\ (.+)/
+                    );
+
+                    if (!match) {
+                      // If we can't match the errors, that means they're in a format we don't recognize.
+                      // Report the entire string as the user will see the raw message.
+                      return { message: error.message };
+                    }
+
+                    const [, service, field, message] = match;
+                    return { service, field, message };
+                  });
+
+                  let result = "";
+
+                  cli.table(decodedErrors, {
+                    columns: [
+                      { key: "service", label: "Service" },
+                      { key: "field", label: "Field" },
+                      { key: "message", label: "Message" }
+                    ],
+                    // The default `printLine` will output to the console; we want to capture the output so we
+                    // can test it.
+                    printLine: line => {
+                      result += `\n${line}`;
                     }
                   });
 
-                  // FIXME: reformat to match other check results
-                  taskOutput.federation = {
-                    errors,
-                    warnings
+                  this.log(result);
+
+                  // We have to throw an error here even though we already reported the errors in a table
+                  // because we need to short-circuit the rest of the tasks in the service check.
+                  throw new Error(
+                    federatedServiceCompositionUnsuccessfulErrorMessage
+                  );
+                }
+              }
+            },
+            {
+              title: `Validating ${
+                serviceName ? "composed" : "local"
+              } schema against tag ${chalk.blue(tag)} on graph ${chalk.blue(
+                configName
+              )}`,
+              task: async (ctx: TasksOutput, task) => {
+                taskOutput.shouldOutputJson = flags.json;
+
+                let schemaCheckSchemaVariables:
+                  | { schemaHash: string }
+                  | { schema: IntrospectionSchemaInput }
+                  | undefined;
+
+                // If we're `federated`, then run composition validation. When we're using composition
+                // validation we'll receive a schema has that represents the composed schema.
+                if (ctx.federationSchemaHash) {
+                  schemaCheckSchemaVariables = {
+                    schemaHash: ctx.federationSchemaHash
                   };
-
-                  if (compositionValidationDetails) {
-                    schemaHash = compositionValidationDetails.schemaHash;
-                  }
-
-                  if (errors.length > 0) {
-                    const decodedErrors = errors.filter(Boolean).map(error => {
-                      // We `filter` by `Boolean` above; this will never happen and is just here to appease
-                      // TypeScript.
-                      if (!error) {
-                        return {};
-                      }
-
-                      const match = error.message.match(
-                        /^\[([^\[]+)\]\s+(\S+)\ ->\ (.+)/
-                      );
-
-                      if (!match) {
-                        // If we can't match the errors, that means they're in a format we don't recognize.
-                        // Report the entire string as the user will see the raw message.
-                        return { message: error.message };
-                      }
-
-                      const [, service, field, message] = match;
-                      return { service, field, message };
-                    });
-
-                    let result = "";
-
-                    cli.table(decodedErrors, {
-                      columns: [
-                        { key: "service", label: "Service" },
-                        { key: "field", label: "Field" },
-                        { key: "message", label: "Message" }
-                      ],
-                      // The default `printLine` will output to the console; we want to capture the output so we can test
-                      // it.
-                      printLine: line => {
-                        result += `\n${line}`;
-                      }
-                    });
-
-                    this.log(result);
-
-                    // We have to throw an error here even though we already reported the errors in a table
-                    // because we need to short-circuit the rest of the tasks in the service check.
-                    throw new Error(
-                      federatedServiceCompositionUnsuccessfulErrorMessage
-                    );
-                  }
                 } else {
                   // This is _not_ a `federated` schema. Resolve the schema given `config.tag`.
-
+                  task.output = "Resolving schema";
                   schema = await project.resolveSchema({ tag: config.tag });
+                  if (!schema) {
+                    throw new Error("Failed to resolve schema");
+                  }
+
+                  schemaCheckSchemaVariables = {
+                    schema: introspectionFromSchema(schema)
+                      .__schema as IntrospectionSchemaInput
+                  };
                 }
 
                 await gitInfo(this.log);
@@ -400,13 +430,7 @@ export default class ServiceCheck extends ProjectCommand {
                   frontend: flags.frontend || config.engine.frontend,
                   ...(historicParameters && { historicParameters }),
                   // `variables` will either contain `schemaHash` or `schema`, not both.
-                  ...(schemaHash
-                    ? { schemaHash }
-                    : {
-                        // XXX Looks like TS should be generating ReadonlyArrays instead
-                        schema: introspectionFromSchema(schema)
-                          .__schema as IntrospectionSchemaInput
-                      })
+                  ...schemaCheckSchemaVariables
                 };
 
                 const { schema: _, ...restVariables } = variables;

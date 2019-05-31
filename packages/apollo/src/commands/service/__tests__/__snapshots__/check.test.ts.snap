@@ -48,10 +48,11 @@ View full details at: https://engine-dev.apollographql.com/service/engine/checks
 exports[`service:check integration federated should report composition errors correctly vanilla 1`] = `
 "Loading Apollo Project [started]
 Loading Apollo Project [completed]
-Validating local schema against tag master on graph engine [started]
-→ Resolving schema
-→ Creating composed schema with accounts service
-Validating local schema against tag master on graph engine [failed]
+Validate graph composition for service accounts on graph engine [started]
+→ Fetching local service's partial schema
+→ Attempting to compose graph with accounts service's partial schema
+Found 3 graph composition errors for service accounts on graph engine [title changed]
+Found 3 graph composition errors for service accounts on graph engine [failed]
 → Federated service composition was unsuccessful. Please see the reasons below.
 
 Service   Field    Message
@@ -65,12 +66,15 @@ accounts  User     A @key selects id, but User.id could not be found
 exports[`service:check integration federated should report composition success correctly vanilla 1`] = `
 "Loading Apollo Project [started]
 Loading Apollo Project [completed]
-Validating local schema against tag master on graph engine [started]
-→ Resolving schema
-→ Creating composed schema with accounts service
+Validate graph composition for service accounts on graph engine [started]
+→ Fetching local service's partial schema
+→ Attempting to compose graph with accounts service's partial schema
+Found 0 graph composition errors for service accounts on graph engine [title changed]
+Found 0 graph composition errors for service accounts on graph engine [completed]
+Validating composed schema against tag master on graph engine [started]
 → Validating schema
-Validated local schema against tag master on graph engine [title changed]
-Validated local schema against tag master on graph engine [completed]
+Validated composed schema against tag master on graph engine [title changed]
+Validated composed schema against tag master on graph engine [completed]
 Comparing schema changes [started]
 Compared 1 schema change against 0 operations over the last 548 days [title changed]
 Compared 1 schema change against 0 operations over the last 548 days [completed]
